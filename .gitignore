@@ -1,0 +1,80 @@
+# =============================================================
+#  QuantSolana — .gitignore
+# =============================================================
+
+# --- SECRETOS Y CREDENCIALES (NUNCA subir) ---
+.env
+*.key
+*.pem
+secrets.json
+api_keys.json
+
+# --- BASES DE DATOS (Datos propios, no compartir) ---
+*.db
+*.sqlite
+*.sqlite3
+
+# --- MODELOS ENTRENADOS (Archivos grandes, regenerables) ---
+*.zip
+*.joblib
+*.pkl
+*.h5
+*.pt
+*.onnx
+
+# --- LOGS Y ESTADO DE RUNTIME (Generados al correr) ---
+paper_trading_log.txt
+live_trading_log.txt
+log_terminal_data.json
+paper_log_terminal_data.json
+live_log_terminal_data.json
+macro_sentiment.json
+sim_state_sol.json
+live_state_sol.json
+config_params.json
+
+# --- TENSORBOARD (Logs de entrenamiento, archivos grandes) ---
+tensorboard_rl_logs/
+runs/
+
+# --- PYTHON ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.installed.cfg
+*.egg
+
+# --- ENTORNOS VIRTUALES ---
+venv/
+env/
+ENV/
+.venv/
+.conda/
+
+# --- IDEs y Editores ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- ARCHIVOS TEMPORALES Y DE DEBUG ---
+inspect_zip.py
+notas
+scratch/
+*.tmp
+*.bak
+
+# --- DATOS DE MERCADO (Regenerables desde la API) ---
+data/
+datasets/
