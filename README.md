@@ -54,8 +54,9 @@ entrenar_filtro_xgb_sol.py     ← XGBoost experience replay filter trainer
 | `wall_gap` | Depth-10 order book wall distance |
 
 ### GPU Optimizer (Cerebro CUDA)
-- Particle Swarm Optimization (PSO) running entirely on GPU via Numba CUDA
-- Continuously optimizes TP%, SL%, OFI thresholds, and IA confidence levels
+- **Differential Evolution** optimizer (via `scipy.optimize`) with a GPU-accelerated backtesting kernel running on Numba CUDA
+- Each candidate set of parameters is evaluated in parallel inside the RTX GPU via a custom `@cuda.jit` kernel — 200 candidates per generation simultaneously
+- Continuously optimizes TP%, SL%, OFI thresholds, and IA confidence levels across the full historical tick dataset
 - Writes optimal parameters to `config_params.json` — loaded hot by the bot every 30s
 
 ### NLP Sentiment Engine (Cerebro Sentimiento)
