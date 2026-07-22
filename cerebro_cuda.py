@@ -152,14 +152,14 @@ def gpu_backtest_kernel(bids, asks, imbs, ofis, ofi_ema_5s, ofi_ema_15s, prob_up
                     entry_price = bid # Orden Taker (cruza spread vendiendo al bid)
         
         # Guardamos resultado
-        # Si opera muy poco (<5 trades), castigamos con costo alto
-        if trades < 5:
+        # Si opera muy poco (<4 trades), castigamos con costo alto
+        if trades < 4:
             results[idx] = 1000000.0 
         else:
             win_rate = wins / trades
-            # Exigimos matemáticamente un Win Rate realista de 65% (Muy rentable con R:R)
-            if win_rate < 0.65:
-                results[idx] = 500000.0 - balance # Castigo masivo
+            # Win Rate realista adaptado a microestructura de alta frecuencia (58%)
+            if win_rate < 0.58:
+                results[idx] = 500000.0 - balance # Castigo
             else:
                 results[idx] = -balance
 
@@ -356,10 +356,10 @@ def optimizar_moneda(simbolo, db_file):
 
     # --- LIMITES MEJORADOS (MAYOR WIN RATE Y MEJOR R:R) ---
     bounds = (
-        (0.0035, 0.0075), # TP (0.35% a 0.75%) - Forzar ganancias más grandes
+        (0.0045, 0.0085), # TP (0.45% a 0.85%) - FORZADO: Siempre buscará ganancias netas > 0.35%
         (0.0040, 0.0065), # SL (0.40% a 0.65%) - TOPE MAXIMO 0.65%
         (0.15, 0.40),
-        (0.65, 0.95), # Mínimo 0.65 IA Conf para buscar más volumen de operaciones
+        (0.65, 0.95), # Minimo 0.65 IA Conf para buscar mas volumen de operaciones
         (0.05, 0.5),
         (0.05, 0.5)
     )

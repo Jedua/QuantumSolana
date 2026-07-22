@@ -24,10 +24,10 @@ class TradingEnv(gym.Env):
         self.n_steps = len(self.df)
         self.initial_balance = initial_balance
         self.leverage = leverage
-        self.taker_fee = taker_fee
-        # FIX #1: El fee debe ser IDENTICO al de produccion (bot_core.ROUND_TRIP_FEE = 0.001)
-        # El fee anterior (taker_fee*2*leverage = 0.02) era 20x MENOR que el fee real en USD relativo
-        self.round_trip_fee = 0.001  # Igual a ROUND_TRIP_FEE en bot_core.py
+        self.taker_fee = taker_fee # Comision por lado (0.05%)
+        # CORRECTO: taker_fee*2*leverage = 0.02 → breakeven a 0.1% de precio = igual que produccion
+        # (0.001/20=0.005% era demasiado facil, enseñaba a salir con micro-movimientos)
+        self.round_trip_fee = taker_fee * 2 * leverage
         
         # Acciones:
         # 0: Hold (No hacer nada o mantener posición actual)
@@ -159,8 +159,16 @@ class TradingEnv(gym.Env):
         # 3: Close Position
         elif action == 3:
             if self.position == 0:
-                reward -= 0.0002  # Castigo por acción inválida
+                reward -= 0.0002  # Castigo por accion invalida
             else:
+                # REWARD ASIMETRICO AL CIERRE:
+                # El modelo aprende QUE tan bueno fue el trade al cerrar
+                if self.unrealized_pnl >= 0.078:      # >= 0.49% TP en produccion
+                    reward += 0.20  # Gran bono: cerro en zona de TP objetivo
+                elif self.unrealized_pnl >= 0.02:    # En positivo pero bajo el objetivo
+                    reward += 0.04  # Bono menor: al menos es ganancia
+                elif self.unrealized_pnl < -0.01:    # Cerrar con perdida significativa
+                    reward -= 0.08  # Penalizacion extra: no debio cerrar aqui
                 self.position = 0
                 self.unrealized_pnl = 0.0
                 self.ticks_in_trade = 0
@@ -179,13 +187,18 @@ class TradingEnv(gym.Env):
             reward += current_net - self.unrealized_pnl
             self.unrealized_pnl = current_net
             
-            # Penalización pequeña por tiempo (Time Decay)
+            # BONO DE PACIENCIA: Estar en zona de ganancia objetivo da recompensa extra
+            # Objetivo: 0.49% TP en produccion = current_net >= 0.078 en el entorno
+            if current_net >= 0.078:
+                reward += 0.003  # Bono continuo por tick que se mantiene en la zona TP
+            
+            # Penalizacion pequeña por tiempo (Time Decay)
             self.ticks_in_trade += 1
             reward -= 0.000005 
             
             # Cortacircuitos de seguridad (Stop Loss Forzado)
-            # FIX #2: Sincronizado con SL de produccion: 0.4% de precio * 20x leverage - fee = -0.079
-            if current_net <= -0.079:  # -0.004 * 20 - 0.001 (SL real de produccion)
+            # SL a 0.63% de precio con fee=0.02: net = -0.0063*20 - 0.02 = -0.146
+            if current_net <= -0.146:  # Equivalente a SL de produccion de 0.63%
                 reward -= 0.3
                 self.position = 0
                 self.unrealized_pnl = 0.0

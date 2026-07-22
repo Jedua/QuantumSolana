@@ -36,7 +36,7 @@ init(autoreset=True)
 warnings.filterwarnings('ignore')
 
 # --- MOTOR PRINCIPAL ---
-async def main_loop(db, ia, exp, risk_manager):
+async def main_loop(db, ia, exp, risk_manager, filtro_xgb):
     print(f"{Fore.MAGENTA}=====================================================")
     print(f"{Fore.MAGENTA} [SISTEMA] SOLANA BOT - PAPER TRADING (SIMULACION)")
     print(f"{Fore.MAGENTA}=====================================================")
@@ -49,6 +49,7 @@ async def main_loop(db, ia, exp, risk_manager):
     ema_15m = None
     rsi_5m = 50.0
     last_mtf_update = 0
+    last_xgb_block_time = 0
 
     cargar_configuracion(CONFIG_FILE)
     print(f"[CONFIG] IA {bot_core.UMBRAL_CONFIANZA_IA} | IMB {bot_core.UMBRAL_IMBALANCE} | TP {bot_core.TAKE_PROFIT_PCT*100:.2f}% | SL {bot_core.STOP_LOSS_PCT*100:.2f}% | OFI {bot_core.OFI_THRESHOLD} | EMA5 {bot_core.OFI_EMA_5_THRESHOLD}")
@@ -349,9 +350,13 @@ async def main_loop(db, ia, exp, risk_manager):
                         # --- GUARDAR SNAPSHOT DE SALIDA (HER) ---
                         exp.guardar_snapshot("CLOSE_" + posicion, precio_salida, pnl_neto_usd, features)
                         
-                        # En simulación/paper eliminamos el congelamiento por pérdidas para maximizar operaciones
-                        rachas_perdidas = 0
-                        cooldown_actual = 5
+                        if pnl_neto_usd < 0:
+                            rachas_perdidas += 1
+                            # Penalización exponencial por rachas de pérdida
+                            cooldown_actual = bot_core.COOLDOWN_SEGUNDOS * (2 ** (rachas_perdidas - 1))
+                        else:
+                            rachas_perdidas = 0
+                            cooldown_actual = 60  # Cooldown base despues de ganar
                         
                         print(f"\n{color}[CERRADO] {motivo} SOL | PnL Bruto: {pnl_pct*100:.2f}% | NETO: ${pnl_neto_usd:.3f}")
                         registrar_trade_log(posicion, precio_entrada, precio_salida, pnl_neto_pct, pnl_neto_usd, PAPER_LOG_FILE, PAPER_TERMINAL_LOG_FILE)
@@ -361,12 +366,37 @@ async def main_loop(db, ia, exp, risk_manager):
                         ultimo_cierre = time.time()
                         timestamp_entrada = 0.0
 
-                    # Procesar Acción RL
+                    # Normalización de OFI a escala [-1, 1] igual al entorno de entrenamiento
+                    vol_base = max(vol_tick, 1.0)
+                    ofi_norm = np.tanh(ofi_t / vol_base)
+                    ofi_ema_5_norm = np.tanh(ofi_ema_5_t / vol_base)
+
+                    # Trigger de Entrada: Señal del modelo RL o impulso relevante en el libro de órdenes
+                    es_trigger_long = (action == 1) or (imbalance >= bot_core.UMBRAL_IMBALANCE and ofi_norm >= 0.05 and rsi_5m < 70)
+                    es_trigger_short = (action == 2) or (imbalance <= -bot_core.UMBRAL_IMBALANCE and ofi_norm <= -0.05 and rsi_5m > 30)
+
+                    # --- FILTRO XGBOOST EXPERIENCIA ---
+                    # Solo filtramos si NO hay posicion (para no interrumpir holds o cierres)
+                    if (action in [1, 2] or es_trigger_long or es_trigger_short) and puede_abrir and posicion is None:
+                        if not filtro_xgb.aprobar_trade(features):
+                            if time.time() - last_xgb_block_time > 10:
+                                print(f"\n{Fore.YELLOW}[FILTRO XGB] Senal bloqueada por seguridad. (Ocultando avisos por 10s){Style.RESET_ALL}")
+                                last_xgb_block_time = time.time()
+                            action = 0 # Anulamos la accion
+                            es_trigger_long = False
+                            es_trigger_short = False
+
+                    # Procesar Acción RL / Trigger Híbrido
                     # 1: Open Long
-                    if action == 1:
+                    if es_trigger_long:
+                        puede_abrir_long = (
+                            puede_abrir and 
+                            imbalance >= (bot_core.UMBRAL_IMBALANCE * 0.7) and 
+                            ofi_norm >= 0.02
+                        )
                         if posicion == 'SHORT': cerrar_posicion("RL_REVERSAL")
-                        if posicion is None and puede_abrir:
-                            print(f"\n{Fore.GREEN}[SIM-RL] SENAL LONG")
+                        if posicion is None and puede_abrir_long:
+                            print(f"\n{Fore.GREEN}[SIM-RL] SENAL LONG (IMB: {imbalance:.2f} | OFI: {ofi_norm:.3f})")
                             posicion = 'LONG'
                             precio_entrada = best_ask
                             # --- RISK MANAGER DECIDE TAMANO POSICION ---
@@ -377,10 +407,15 @@ async def main_loop(db, ia, exp, risk_manager):
                             exp.guardar_snapshot("OPEN_LONG", precio_entrada, 0.0, features)
                             
                     # 2: Open Short
-                    elif action == 2:
+                    elif es_trigger_short:
+                        puede_abrir_short = (
+                            puede_abrir and 
+                            imbalance <= -(bot_core.UMBRAL_IMBALANCE * 0.7) and 
+                            ofi_norm <= -0.02
+                        )
                         if posicion == 'LONG': cerrar_posicion("RL_REVERSAL")
-                        if posicion is None and puede_abrir:
-                            print(f"\n{Fore.RED}[SIM-RL] SENAL SHORT")
+                        if posicion is None and puede_abrir_short:
+                            print(f"\n{Fore.RED}[SIM-RL] SENAL SHORT (IMB: {imbalance:.2f} | OFI: {ofi_norm:.3f})")
                             posicion = 'SHORT'
                             precio_entrada = best_bid
                             # --- RISK MANAGER DECIDE TAMANO POSICION ---
@@ -390,10 +425,11 @@ async def main_loop(db, ia, exp, risk_manager):
                             # --- GUARDAR SNAPSHOT DE ENTRADA (HER) ---
                             exp.guardar_snapshot("OPEN_SHORT", precio_entrada, 0.0, features)
                             
-                    # 3: Close Position (Sin restricciones — el RL decide libremente cuándo salir)
-                    # GUARD: No cerrar posiciones con menos de 30s abiertas (evita trades fantasma por fees)
+                    # 3: Close Position (Bloqueado para FORZAR TP)
+                    # GUARD: El RL SOLO puede cerrar prematuramente si ya estamos en 0.45% bruto (0.35% neto)
+                    # o si el trade lleva más de 15 minutos atascado (900 segs) sin ir a ninguna parte.
                     elif action == 3 and posicion is not None:
-                        if time.time() - timestamp_entrada >= 30:
+                        if current_pnl_pct >= 0.0045 or (time.time() - timestamp_entrada > 900):
                             cerrar_posicion("RL_CLOSE")
                         
                     # Cierres Automáticos (Stop Loss, Take Profit, Trailing Stop)
@@ -436,13 +472,16 @@ if __name__ == "__main__":
     exp = GestorExperiencia(os.path.join(PARENT_DIR, "cerebro_experiencia.db"))
     risk_manager = RiskManager(balance_inicial=100.0, max_leverage=LEVERAGE)
     
+    from bot_core import FiltroExperienciaXGB
+    filtro_xgb = FiltroExperienciaXGB(os.path.join(PARENT_DIR, "filtro_xgb_sol.joblib"))
+    
     try:
         while True:
             try:
-                asyncio.run(main_loop(db, ia, exp, risk_manager))
+                asyncio.run(main_loop(db, ia, exp, risk_manager, filtro_xgb))
             except Exception as e:
-                print(f"[ERROR] Reiniciando loop principal por: {e}")
-                time.sleep(5)
+                print(f"{Fore.RED}[ERROR RED] Falla de conexion (probablemente sin internet). Reintentando en 15s... Detalles: {e}")
+                time.sleep(15)
     except KeyboardInterrupt:
         print("\n[SISTEMA] Simulador SOL Detenido. Guardando datos finales...")
         db.close()

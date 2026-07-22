@@ -54,20 +54,25 @@ def main():
         print(f"{Fore.GREEN}MODO PAPER TRADING (Simulacion Segura).{Style.RESET_ALL}")
 
     # --- LIMPIEZA DE ESTADO Y LOGS ---
-    print(f"{Fore.YELLOW}[ORQUESTADOR] Limpiando archivos de estado y logs para empezar desde cero (nueva cuenta)...")
-    archivos_a_limpiar = [
-        "paper_trading_log.txt", "live_trading_log.txt",
-        "sim_state_sol.json", "live_state_sol.json",
-        "paper_log_terminal_data.json", "live_log_terminal_data.json"
-    ]
-    for archivo in archivos_a_limpiar:
-        ruta = os.path.join(os.path.dirname(os.path.abspath(__file__)), archivo)
-        if os.path.exists(ruta):
-            try:
-                os.remove(ruta)
-                print(f"{Fore.CYAN}  - Eliminado: {archivo}")
-            except Exception as e:
-                print(f"{Fore.RED}  - Error eliminando {archivo}: {e}")
+    respuesta = input(f"{Fore.YELLOW}[?] ¿Deseas empezar desde cero borrando el historial de trades? (s/N): {Style.RESET_ALL}").strip().lower()
+    
+    if respuesta == 's':
+        print(f"{Fore.YELLOW}[ORQUESTADOR] Limpiando archivos de estado y logs para empezar desde cero...")
+        archivos_a_limpiar = [
+            "paper_trading_log.txt", "live_trading_log.txt",
+            "sim_state_sol.json", "live_state_sol.json",
+            "paper_log_terminal_data.json", "live_log_terminal_data.json"
+        ]
+        for archivo in archivos_a_limpiar:
+            ruta = os.path.join(os.path.dirname(os.path.abspath(__file__)), archivo)
+            if os.path.exists(ruta):
+                try:
+                    os.remove(ruta)
+                    print(f"{Fore.CYAN}  - Eliminado: {archivo}")
+                except Exception as e:
+                    print(f"{Fore.RED}  - Error eliminando {archivo}: {e}")
+    else:
+        print(f"{Fore.GREEN}[ORQUESTADOR] Retomando sesión anterior. Los logs y el estado se mantendrán.{Style.RESET_ALL}")
 
     # --- VERIFICACION DE ENTORNO CUDA ---
     try:

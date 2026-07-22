@@ -399,11 +399,17 @@ async def main_loop(db, ia, exp, risk_manager):
                         hora_actual = datetime.now().strftime("%H:%M:%S")
                         print(f"\r\033[2K{hora_actual} | SOL {mid_price:.2f} | IMB: {col}{imbalance:.2f}{Style.RESET_ALL} | ACT:{action} | {regime_str}{estado_str}", end='', flush=True)
 
-                # --- LOGICA DE TRADING RL (SIMULADA) ---
+                # --- LOGICA DE TRADING RL ---
                 if ia.trained and not estado_hibernacion:
                     
                     if time.time() - ultimo_cierre < cooldown_actual:
                         continue
+
+                    # --- FILTROS DE CALIDAD PRE-ENTRADA ---
+                    puede_abrir = (
+                        regimen_actual != "SHOCK" and
+                        spread_pct <= SPREAD_MAXIMO_PCT
+                    )
                         
                     # FUNCION DE CIERRE AUXILIAR
                     def cerrar_posicion(motivo="RL_CLOSE"):
@@ -461,12 +467,26 @@ async def main_loop(db, ia, exp, risk_manager):
                         timestamp_entrada = 0
                         cantidad_comprada = 0.0
 
-                    # Procesar Acción RL
+                    # Normalización de OFI a escala [-1, 1] igual al entorno de entrenamiento
+                    vol_base = max(vol_tick, 1.0)
+                    ofi_norm = np.tanh(ofi_t / vol_base)
+                    ofi_ema_5_norm = np.tanh(ofi_ema_5_t / vol_base)
+
+                    # Trigger de Entrada: Señal del modelo RL o impulso relevante en el libro de órdenes
+                    es_trigger_long = (action == 1) or (imbalance >= bot_core.UMBRAL_IMBALANCE and ofi_norm >= 0.05 and rsi_5m < 70)
+                    es_trigger_short = (action == 2) or (imbalance <= -bot_core.UMBRAL_IMBALANCE and ofi_norm <= -0.05 and rsi_5m > 30)
+
+                    # Procesar Acción RL / Trigger Híbrido
                     # 1: Open Long
-                    if action == 1:
+                    if es_trigger_long:
+                        puede_abrir_long = (
+                            puede_abrir and 
+                            imbalance >= (bot_core.UMBRAL_IMBALANCE * 0.7) and 
+                            ofi_norm >= 0.02
+                        )
                         # if posicion == 'SHORT': cerrar_posicion("RL_REVERSAL") # Desactivado: Evitar micro-cierres
-                        if posicion is None:
-                            print(f"\n{Fore.GREEN}[LIVE-RL] SENAL LONG")
+                        if posicion is None and puede_abrir_long:
+                            print(f"\n{Fore.GREEN}[LIVE-RL] SENAL LONG (IMB: {imbalance:.2f} | OFI: {ofi_norm:.3f})")
                             precio_entrada = best_ask
                             cantidad_comprada = round((MONTO_USDT * LEVERAGE) / precio_entrada, 3)
                             exito, err_msg = ejecutar_orden_mercado(SYMBOL_WSS, SIDE_BUY, cantidad_comprada)
@@ -487,10 +507,15 @@ async def main_loop(db, ia, exp, risk_manager):
                             exp.guardar_snapshot("OPEN_LONG", precio_entrada, 0.0, features)
                             
                     # 2: Open Short
-                    elif action == 2:
+                    elif es_trigger_short:
+                        puede_abrir_short = (
+                            puede_abrir and 
+                            imbalance <= -(bot_core.UMBRAL_IMBALANCE * 0.7) and 
+                            ofi_norm <= -0.02
+                        )
                         # if posicion == 'LONG': cerrar_posicion("RL_REVERSAL") # Desactivado: Evitar micro-cierres
-                        if posicion is None:
-                            print(f"\n{Fore.RED}[LIVE-RL] SENAL SHORT")
+                        if posicion is None and puede_abrir_short:
+                            print(f"\n{Fore.RED}[LIVE-RL] SENAL SHORT (IMB: {imbalance:.2f} | OFI: {ofi_norm:.3f})")
                             precio_entrada = best_bid
                             cantidad_comprada = round((MONTO_USDT * LEVERAGE) / precio_entrada, 3)
                             exito, err_msg = ejecutar_orden_mercado(SYMBOL_WSS, SIDE_SELL, cantidad_comprada)
@@ -510,11 +535,12 @@ async def main_loop(db, ia, exp, risk_manager):
                             # --- GUARDAR SNAPSHOT DE ENTRADA (HER) ---
                             exp.guardar_snapshot("OPEN_SHORT", precio_entrada, 0.0, features)
                             
-                    # 3: Close Position (Botón de Pánico Inteligente)
+                    # 3: Close Position (Bloqueado para FORZAR TP)
+                    # GUARD: El RL SOLO puede cerrar prematuramente si ya estamos en 0.45% bruto (0.35% neto)
+                    # o si el trade lleva más de 15 minutos atascado (900 segs) sin ir a ninguna parte.
                     elif action == 3 and posicion is not None:
-                        # Filtro de ruido: Solo abortar si ya va perdiendo al menos -0.15% (-0.0015 en decimal)
-                        if current_pnl_pct <= -0.0015:
-                            cerrar_posicion("RL_PANIC_CUT")
+                        if current_pnl_pct >= 0.0045 or (time.time() - timestamp_entrada > 900):
+                            cerrar_posicion("RL_CLOSE")
                         
                     # Cierres Automáticos (Stop Loss, Take Profit, Trailing Stop)
                     if posicion is not None:

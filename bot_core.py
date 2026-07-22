@@ -149,7 +149,7 @@ def guardar_estado_simulacion(state_file_path, posicion, precio_entrada, max_pnl
         log_terminal_event("ERROR", "STATE_SAVE_ERROR", f"No se pudo guardar estado simulado: {str(e)}", state_file_path)
 
 def cargar_estado_simulacion(state_file_path):
-    if os.path.exists(state_file_path):
+    if os.path.exists(state_file_path) and os.path.getsize(state_file_path) > 0:
         try:
             with open(state_file_path, 'r') as f:
                 st = json.load(f)
@@ -600,7 +600,7 @@ class CerebroRL:
         ], dtype=np.float32)
         
         # SB3 devuelve un tuple (action, state). Solo nos importa la accion.
-        action, _states = self.model.predict(obs, deterministic=True)
+        action, _states = self.model.predict(obs, deterministic=False)
                 
         return int(action)
 
@@ -645,8 +645,15 @@ class FiltroExperienciaXGB:
                 data_dict.get(col, 0.0) for col in features_cols
             ]], dtype=np.float32)
             
-            pred = self.model.predict(obs)[0]
-            return bool(pred == 1)
+            # En lugar de predict (que exige 50% de prob), usamos predict_proba para ser mas flexibles
+            # Bajamos el umbral a 35% de probabilidad de exito para que deje pasar mas trades.
+            proba_exito = self.model.predict_proba(obs)[0][1]
+            umbral_aceptacion = 0.35 
+            
+            # Solo para ver como evalua en la terminal en debug, descomentar si es necesario:
+            # print(f"  -> Prob XGB: {proba_exito:.2f}") 
+            
+            return bool(proba_exito >= umbral_aceptacion)
         except Exception as e:
             print(f"{Fore.RED}[XGB ERROR] Error en inferencia: {e}")
             return True # Ante la duda, si falla el codigo del filtro, no bloqueamos
