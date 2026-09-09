@@ -5,14 +5,11 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import json
 import os
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 import time
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 import xml.etree.ElementTree as ET
 from colorama import Fore, Style, init
-from transformers import pipeline, logging as hf_logging
-
 init(autoreset=True)
-hf_logging.set_verbosity_error()
 
 # --- Configuracion ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -29,16 +26,10 @@ RSS_FEEDS = [
     "https://u.today/rss"
 ]
 
-print(f"{Fore.CYAN}[SENTIMENT] Inicializando FinBERT local (esto puede tardar unos segundos)...")
-# Usamos un pipeline de HuggingFace optimizado para GPU si es posible
-try:
-    import torch
-    device = 0 if torch.cuda.is_available() else -1
-    sentiment_analyzer = pipeline("sentiment-analysis", model="ProsusAI/finbert", device=device)
-    print(f"{Fore.GREEN}[SENTIMENT] FinBERT cargado en {'GPU' if device == 0 else 'CPU'}.")
-except Exception as e:
-    print(f"{Fore.RED}[SENTIMENT ERROR] No se pudo cargar FinBERT: {e}")
-    sentiment_analyzer = None
+# Configuracion Ollama Local
+OLLAMA_URL = "http://127.0.0.1:11435/api/generate"
+OLLAMA_MODEL = "qwen2.5-coder:14b"
+print(f"{Fore.CYAN}[SENTIMENT] Usando modelo local de Ollama: {OLLAMA_MODEL} en {OLLAMA_URL}")
 
 def guardar_sentimiento(score):
     """Guarda el score en un archivo JSON para que el bot de trading lo lea."""
@@ -103,31 +94,50 @@ async def obtener_noticias():
 
 def analizar_textos(textos):
     """
-    Pasa la lista de titulares por el modelo FinBERT y promedia la confianza.
+    Pasa la lista de titulares por el modelo local de Ollama y extrae un float de sentimiento.
     """
-    if not sentiment_analyzer or not textos:
+    if not textos:
         return 0.0
     
+    # Preparamos el texto a analizar
+    titulares_str = "\n".join([f"- {t}" for t in textos])
+    
+    prompt = f"""
+Actúa como un analista cuantitativo de criptomonedas.
+Tu objetivo es analizar el sentimiento general del mercado de Solana (SOL) y cripto basándote en los siguientes titulares de noticias recientes.
+
+Titulares:
+{titulares_str}
+
+Instrucción estricta:
+Responde ÚNICAMENTE con un número decimal entre -1.0 (pánico extremo / mercado muy bajista) y 1.0 (euforia extrema / mercado muy alcista). No incluyas palabras, explicaciones, markdown ni texto adicional. Solo el número.
+"""
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.0, # Determinístico
+            "num_predict": 10   # Respuesta corta
+        }
+    }
+    
     try:
-        resultados = sentiment_analyzer(textos)
-        score_total = 0.0
-        
-        for res in resultados:
-            # FinBERT retorna labels: positive, negative, neutral
-            label = res['label']
-            confianza = res['score']
-            
-            if label == 'positive':
-                score_total += confianza
-            elif label == 'negative':
-                score_total -= confianza
-                # Neutral no suma ni resta
-                
-        # Promediamos el score y lo mantenemos entre -1.0 y 1.0
-        score_promedio = score_total / len(textos)
-        return max(min(score_promedio, 1.0), -1.0)
+        response = requests.post(OLLAMA_URL, json=payload, timeout=20)
+        if response.status_code == 200:
+            data = response.json()
+            respuesta_texto = data.get("response", "").strip()
+            score = float(respuesta_texto)
+            return max(min(score, 1.0), -1.0)
+        else:
+            print(f"{Fore.YELLOW}[SENTIMENT ERROR] Error HTTP de Ollama: {response.status_code}")
+            return 0.0
+    except ValueError:
+        print(f"{Fore.YELLOW}[SENTIMENT ERROR] Ollama no devolvio un numero valido: '{respuesta_texto}'")
+        return 0.0
     except Exception as e:
-        print(f"{Fore.RED}[SENTIMENT ERROR] Falla en inferencia NLP: {e}")
+        print(f"{Fore.RED}[SENTIMENT ERROR] Falla en conexion con Ollama: {e}")
         return 0.0
 
 async def main_loop():

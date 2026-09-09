@@ -1,4 +1,10 @@
 import os
+conda_bin = r"C:\Users\pepel\miniconda3\envs\cerebro_v10\Library\bin"
+if os.path.exists(conda_bin):
+    os.environ["PATH"] = conda_bin + os.pathsep + os.environ.get("PATH", "")
+    if hasattr(os, "add_dll_directory"):
+        try: os.add_dll_directory(conda_bin)
+        except Exception: pass
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 import numpy as np
 import pandas as pd
@@ -53,17 +59,16 @@ def cargar_datos(db_name, limite=900000):
 
 # --- KERNEL CUDA (ESTO CORRE DENTRO DE LA RTX 4070) ---
 @cuda.jit
-def gpu_backtest_kernel(bids, asks, imbs, ofis, ofi_ema_5s, ofi_ema_15s, prob_ups, prob_downs, ema_15m_dists, rsi_5ms, macro_sentiments, params, results):
+def gpu_backtest_kernel(bids, asks, imbs, ofis, ofi_ema_5s, ofi_ema_15s, prob_ups, prob_downs, ema_15m_dists, rsi_5ms, macro_sentiments, atr_5ms, params, results):
     # Identificamos qué hilo (partícula) somos
     idx = cuda.grid(1)
     
     # Verificamos que no nos salgamos del array de partículas
     if idx < params.shape[0]:
-        tp = params[idx, 0]
-        sl = params[idx, 1]
+        k_tp = params[idx, 0] # Multiplo dinámico ATR para TP (1.2 a 3.5)
+        k_sl = params[idx, 1] # Multiplo dinámico ATR para SL (0.8 a 2.0)
         imb_thresh = params[idx, 2]
         conf_thresh = params[idx, 3]
-        # Nuevos parametros para OFI
         ofi_thresh = params[idx, 4]
         ofi_ema_5_thresh = params[idx, 5]
         
@@ -91,6 +96,7 @@ def gpu_backtest_kernel(bids, asks, imbs, ofis, ofi_ema_5s, ofi_ema_15s, prob_up
             bid = bids[i]
             ask = asks[i]
             mid = (bid + ask) / 2.0
+            atr_val = atr_5ms[i]
             
             ret = abs(mid - prev_mid) / prev_mid
             prev_mid = mid
@@ -108,20 +114,22 @@ def gpu_backtest_kernel(bids, asks, imbs, ofis, ofi_ema_5s, ofi_ema_15s, prob_up
                 if ratio > 2.5 or ratio < 0.4:
                     is_normal_regime = False
             
-            # 1. GESTIÓN DE SALIDA
+            # 1. GESTIÓN DE SALIDA DINÁMICA VÍA ATR
             if posicion != 0:
                 pnl_pct = 0.0
                 closed = False
+                tp_dist = k_tp * atr_val
+                sl_dist = k_sl * atr_val
                 
                 if posicion == 1: # LONG
-                    pnl_pct = (bid - entry_price) / entry_price # Sale cruzando el spread (vendiendo al Bid)
-                    if pnl_pct >= tp or pnl_pct <= -sl:
+                    if (bid - entry_price) >= tp_dist or (entry_price - bid) >= sl_dist:
                         closed = True
+                        pnl_pct = (bid - entry_price) / entry_price
                         
                 elif posicion == -1: # SHORT
-                    pnl_pct = (entry_price - ask) / entry_price # Sale cruzando el spread (comprando al Ask)
-                    if pnl_pct >= tp or pnl_pct <= -sl:
+                    if (entry_price - ask) >= tp_dist or (ask - entry_price) >= sl_dist:
                         closed = True
+                        pnl_pct = (entry_price - ask) / entry_price
                 
                 if closed:
                     # Cálculo de ganancia neta restando comisiones
@@ -144,30 +152,42 @@ def gpu_backtest_kernel(bids, asks, imbs, ofis, ofi_ema_5s, ofi_ema_15s, prob_up
                 tendencia_alcista = ema_15m_dists[i] >= -0.001 and rsi_5ms[i] < 70.0 and sentiment > -0.20
                 tendencia_bajista = ema_15m_dists[i] <= 0.001 and rsi_5ms[i] > 30.0 and sentiment < 0.20
                 
-                if prob_ups[i] > conf_thresh and current_imb > imb_thresh and ofis[i] > ofi_thresh and ofi_ema_5s[i] > ofi_ema_5_thresh and tendencia_alcista:
+                if prob_ups[i] > conf_thresh and current_imb > imb_thresh and tendencia_alcista:
                     posicion = 1
                     entry_price = ask # Orden Taker (cruza spread comprando al ask)
-                elif prob_downs[i] > conf_thresh and current_imb < -imb_thresh and ofis[i] < -ofi_thresh and ofi_ema_5s[i] < -ofi_ema_5_thresh and tendencia_bajista:
+                elif prob_downs[i] > conf_thresh and current_imb < -imb_thresh and tendencia_bajista:
                     posicion = -1
                     entry_price = bid # Orden Taker (cruza spread vendiendo al bid)
         
-        # Guardamos resultado
-        # Si opera muy poco (<4 trades), castigamos con costo alto
-        if trades < 4:
-            results[idx] = 1000000.0 
+        # Guardamos resultado continuo
+        if trades < 5:
+            results[idx] = 1000.0 
         else:
-            win_rate = wins / trades
-            # Win Rate realista adaptado a microestructura de alta frecuencia (58%)
-            if win_rate < 0.58:
-                results[idx] = 500000.0 - balance # Castigo
-            else:
-                results[idx] = -balance
+            win_rate = wins / float(trades)
+            penalty = 0.0
+            if win_rate < 0.35:
+                penalty = (0.35 - win_rate) * 50.0
+            results[idx] = -balance + penalty
 
-def fitness_function_cuda(params, d_bids, d_asks, d_imbs, d_ofis, d_ofi_ema_5s, d_ofi_ema_15s, d_prob_ups, d_prob_downs, d_ema_15m_dists, d_rsi_5ms, d_macro_sentiments):
+def fitness_function_cuda(params, d_bids, d_asks, d_imbs, d_ofis, d_ofi_ema_5s, d_ofi_ema_15s, d_prob_ups, d_prob_downs, d_ema_15m_dists, d_rsi_5ms, d_macro_sentiments, d_atr_5ms):
     n_particles = params.shape[0]
-    
-    # Reservamos memoria en GPU para los resultados de este lote
     results = np.zeros(n_particles, dtype=np.float64)
+    
+    # Invocamos el Kernel
+    threadsperblock = 64
+    blockspergrid = (n_particles + (threadsperblock - 1)) // threadsperblock
+    
+    d_params = cuda.to_device(params)
+    d_results = cuda.to_device(results)
+    
+    gpu_backtest_kernel[blockspergrid, threadsperblock](
+        d_bids, d_asks, d_imbs, d_ofis, d_ofi_ema_5s, d_ofi_ema_15s, 
+        d_prob_ups, d_prob_downs, d_ema_15m_dists, d_rsi_5ms, d_macro_sentiments, d_atr_5ms,
+        d_params, d_results
+    )
+    
+    results = d_results.copy_to_host()
+    return results
     d_results = cuda.to_device(results)
     
     # Copiamos los parámetros del enjambre a la GPU
@@ -314,23 +334,19 @@ def optimizar_moneda(simbolo, db_file):
     
     df['ofi'] = df['e_b'] - df['e_a']
     
-    # EMAs iterativas (sin usar rolling de pandas para replicar la logica del bot)
-    span_5 = 5
-    alpha_5 = 2 / (span_5 + 1)
-    span_15 = 15
-    alpha_15 = 2 / (span_15 + 1)
-    
-    df['ofi_ema_5'] = 0.0
-    df['ofi_ema_15'] = 0.0
-    
+    # EMAs vectorizadas nativas (equivalente matemático exacto)
     if len(df) > 0:
-        df.loc[0, 'ofi_ema_5'] = df.loc[0, 'ofi']
-        df.loc[0, 'ofi_ema_15'] = df.loc[0, 'ofi']
-        for i in range(1, len(df)):
-            df.loc[i, 'ofi_ema_5'] = alpha_5 * df.loc[i, 'ofi'] + (1 - alpha_5) * df.loc[i-1, 'ofi_ema_5']
-            df.loc[i, 'ofi_ema_15'] = alpha_15 * df.loc[i, 'ofi'] + (1 - alpha_15) * df.loc[i-1, 'ofi_ema_15']
+        df['ofi_ema_5'] = df['ofi'].ewm(span=5, adjust=False).mean()
+        df['ofi_ema_15'] = df['ofi'].ewm(span=15, adjust=False).mean()
+    else:
+        df['ofi_ema_5'] = 0.0
+        df['ofi_ema_15'] = 0.0
 
     df = df.dropna() # Eliminar NaNs generados por shift y EMAs iniciales
+
+    # --- CÁLCULO DE ATR 5M (True Range sobre Ticks) ---
+    tr = np.maximum(df['best_ask'] - df['best_bid'], np.abs(df['best_bid'] - df['best_bid'].shift(1).fillna(df['best_bid'])))
+    df['atr_5m'] = tr.rolling(300, min_periods=1).mean().fillna(0.01)
 
     # --- NUEVO: ENTRENAR IA Y GENERAR PREDICCIONES ---
     prob_ups, prob_downs = entrenar_y_predecir_ia(df.copy())
@@ -352,20 +368,21 @@ def optimizar_moneda(simbolo, db_file):
     d_ema_15m_dists = cuda.to_device(df['ema_15m_dist'].to_numpy().astype(np.float64))
     d_rsi_5ms = cuda.to_device(df['rsi_5m'].to_numpy().astype(np.float64))
     d_macro_sentiments = cuda.to_device(df['macro_sentiment'].to_numpy().astype(np.float64))
+    d_atr_5ms = cuda.to_device(df['atr_5m'].to_numpy().astype(np.float64))
     # ---------------------------
 
-    # --- LIMITES MEJORADOS (MAYOR WIN RATE Y MEJOR R:R) ---
+    # --- LIMITES DINÁMICOS VÍA MÚLTIPLOS DE ATR ---
     bounds = (
-        (0.0045, 0.0085), # TP (0.45% a 0.85%) - FORZADO: Siempre buscará ganancias netas > 0.35%
-        (0.0040, 0.0065), # SL (0.40% a 0.65%) - TOPE MAXIMO 0.65%
-        (0.15, 0.40),
-        (0.65, 0.95), # Minimo 0.65 IA Conf para buscar mas volumen de operaciones
-        (0.05, 0.5),
-        (0.05, 0.5)
+        (1.2, 3.5),   # k_tp: Multiplo Dinamico ATR (1.2x a 3.5x)
+        (0.8, 2.0),   # k_sl: Multiplo Dinamico ATR (0.8x a 2.0x)
+        (0.04, 0.25), # imbalance: 4% a 25%
+        (0.50, 0.80), # ia_confidence: 50% a 80%
+        (0.0, 0.05),  # ofi_threshold: 0.0 a 0.05
+        (0.0, 0.05)   # ofi_ema_5_threshold: 0.0 a 0.05
     )
     
     result = differential_evolution(
-        lambda p: fitness_function_cuda(np.ascontiguousarray(p.T), d_bids, d_asks, d_imbs, d_ofis, d_ofi_ema_5s, d_ofi_ema_15s, d_prob_ups, d_prob_downs, d_ema_15m_dists, d_rsi_5ms, d_macro_sentiments),
+        lambda p: fitness_function_cuda(np.ascontiguousarray(p.T), d_bids, d_asks, d_imbs, d_ofis, d_ofi_ema_5s, d_ofi_ema_15s, d_prob_ups, d_prob_downs, d_ema_15m_dists, d_rsi_5ms, d_macro_sentiments, d_atr_5ms),
         bounds=bounds,
         strategy='best1bin',
         maxiter=50,
@@ -391,6 +408,7 @@ def optimizar_moneda(simbolo, db_file):
     d_ema_15m_dists = None
     d_rsi_5ms = None
     d_macro_sentiments = None
+    d_atr_5ms = None
     
     if cost >= 400000: # Rechaza si el costo tiene la penalizacion de Win Rate (500k) o falta de trades (1M)
         print(f"{Fore.RED}[WARNING] {simbolo}: No rentable.")
@@ -403,31 +421,57 @@ def optimizar_moneda(simbolo, db_file):
     print(f"[METRICA] Ganancia Total: ${ganancia_proyectada:.2f}")
     print(f"[METRICA] Proyeccion Diaria: ${ganancia_diaria:.2f} / dia")
     
+    # PROTECCION: Si la proyeccion diaria es menor a $2.00, NO modificar la config actual
+    if ganancia_diaria < 2.0:
+        print(f"{Fore.YELLOW}[PROTECCION] Optimizador reporta proyeccion baja (${ganancia_diaria:.2f}/dia). Config actual PROTEGIDA. No se sobreescribe.")
+        return None
+    
+    mean_atr = float(df['atr_5m'].mean()) if 'atr_5m' in df and not df['atr_5m'].empty else 0.002
+    last_price = float(df['best_bid'].iloc[-1]) if 'best_bid' in df and not df['best_bid'].empty else 150.0
+    tp_pct = round((float(pos[0]) * mean_atr) / last_price, 5) if last_price > 0 else 0.0045
+    sl_pct = round((float(pos[1]) * mean_atr) / last_price, 5) if last_price > 0 else 0.0055
+
     return {
-        "take_profit": round(float(pos[0]), 5),
-        "stop_loss": round(float(pos[1]), 5),
+        "take_profit": max(tp_pct, 0.0035),  # Minimo 0.35% (breakeven real con comisiones)
+        "stop_loss": max(sl_pct, 0.0040),    # Minimo 0.40% (ratio R:R minimo 1:1)
+        "k_tp": round(float(pos[0]), 3),
+        "k_sl": round(float(pos[1]), 3),
         "imbalance": round(float(pos[2]), 3),
-        "ia_confidence": round(float(pos[3]), 3), # Confianza IA
-        "ofi_threshold": round(float(pos[4]), 3), # Umbral OFI
-        "ofi_ema_5_threshold": round(float(pos[5]), 3), # Umbral EMA 5
+        "ia_confidence": round(float(pos[3]), 3),
+        "ofi_threshold": round(float(pos[4]), 3),
+        "ofi_ema_5_threshold": round(float(pos[5]), 3),
         "last_update": datetime.now().strftime("%H:%M:%S")
     }
 
 def main():
-    if not cuda.is_available():
-        print(f"{Fore.RED}[ERROR CRITICO] GPU NO DETECTADA POR NUMBA.")
-        print(f"{Fore.RED}[SOLUCION] Asegurese de ejecutar esto desde el entorno 'cerebro_gpu' de Conda.")
-        return 
-        
+    has_cuda = False
+    try:
+        if cuda.is_available():
+            has_cuda = True
+    except Exception as e:
+        print(f"{Fore.YELLOW}[ADVERTENCIA] Chequeo directo Numba CUDA reporto: {e}")
+
+    if not has_cuda:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                print(f"{Fore.YELLOW}[ADVERTENCIA] Numba no cargo GPU directamente, pero PyTorch CUDA esta activo en: {torch.cuda.get_device_name(0)}")
+                has_cuda = True
+        except ImportError:
+            pass
+
+    if not has_cuda:
+        print(f"{Fore.YELLOW}[ADVERTENCIA] No se confirmo aceleracion CUDA por Numba/PyTorch. Continuando ejecucion adaptativa...")
+
     print(f"{Fore.MAGENTA}=============================================")
-    print(f"{Fore.MAGENTA}      CEREBRO V9 CUDA - POWERED BY NVIDIA    ")
+    print(f"{Fore.MAGENTA}      CEREBRO V10 CUDA - POWERED BY NVIDIA   ")
     print(f"{Fore.MAGENTA}=============================================")
     
     try:
         gpu = cuda.get_current_device()
         print(f"Tarjeta Grafica: {gpu.name.decode('utf-8')}")
-    except:
-        print("Error obteniendo nombre de GPU, pero CUDA parece activo.")
+    except Exception:
+        print("Continuando ejecucion de optimizacion CUDA...")
     
     while True:
         try:

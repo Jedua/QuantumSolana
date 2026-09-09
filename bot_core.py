@@ -17,12 +17,14 @@ warnings.filterwarnings('ignore')
 
 # --- CONFIGURACION GENERAL (SHARED) ---
 # These will be loaded from config_params.json or set as defaults
-UMBRAL_CONFIANZA_IA = 0.85
-TAKE_PROFIT_PCT = 0.0049  # 0.49%
-STOP_LOSS_PCT = 0.0063   # 0.63%
-UMBRAL_IMBALANCE = 0.25
-OFI_THRESHOLD = 0.01
-OFI_EMA_5_THRESHOLD = 0.01
+UMBRAL_CONFIANZA_IA = 0.55
+ROUND_TRIP_FEE = 0.0010  # 0.10% total (0.05% Taker Buy + 0.05% Taker Sell)
+LEVERAGE = 25
+TAKE_PROFIT_PCT = 0.0060  # 0.60% (Fijo, protegido del optimizador)
+STOP_LOSS_PCT = 0.0040    # 0.40% (Fijo, protegido del optimizador)
+UMBRAL_IMBALANCE = 0.08
+OFI_THRESHOLD = 0.0
+OFI_EMA_5_THRESHOLD = 0.0
 
 # PARAMETROS FIJOS (SHARED)
 VENTANA_APRENDIZAJE = 50000
@@ -63,12 +65,12 @@ def cargar_configuracion(config_file_path):
         with open(config_file_path, 'r') as f:
             data = json.load(f)
             params = data.get("SOL", {})
-            if "take_profit" in params: TAKE_PROFIT_PCT = params["take_profit"]
-            if "stop_loss" in params: STOP_LOSS_PCT = params["stop_loss"]
-            if "imbalance" in params: UMBRAL_IMBALANCE = params["imbalance"]
-            if "ia_confidence" in params: UMBRAL_CONFIANZA_IA = params["ia_confidence"]
-            if "ofi_threshold" in params: OFI_THRESHOLD = params["ofi_threshold"]
-            if "ofi_ema_5_threshold" in params: OFI_EMA_5_THRESHOLD = params["ofi_ema_5_threshold"]
+            if "take_profit" in params: TAKE_PROFIT_PCT = float(params["take_profit"])
+            if "stop_loss" in params: STOP_LOSS_PCT = float(params["stop_loss"])
+            if "imbalance" in params: UMBRAL_IMBALANCE = float(params["imbalance"])
+            if "ia_confidence" in params: UMBRAL_CONFIANZA_IA = float(params["ia_confidence"])
+            if "ofi_threshold" in params: OFI_THRESHOLD = float(params["ofi_threshold"])
+            if "ofi_ema_5_threshold" in params: OFI_EMA_5_THRESHOLD = float(params["ofi_ema_5_threshold"])
             return True
     except Exception as e:
         print(f"{Fore.RED}[ERROR] Error cargando configuracion: {e}")
@@ -90,27 +92,36 @@ def log_terminal_event(level, event_type, message, terminal_log_file_path, metad
     except Exception as e:
         print(f"{Fore.RED}[ERROR] No se pudo escribir en el log terminal: {e}")
 
-def registrar_trade_log(tipo, entry_price, exit_price, pnl_pct, pnl_usd, log_file_path, terminal_log_file_path):
+def registrar_trade_log(log_file_path, tipo, entry_price, exit_price, pnl_usd, pnl_pct, motivo="", terminal_log_file_path=None):
     """Registra un resumen del trade en el log de trades y en el log terminal JSON."""
     try:
+        entry_p = float(entry_price) if entry_price is not None else 0.0
+        exit_p = float(exit_price) if exit_price is not None else 0.0
+        usd_pnl = float(pnl_usd) if pnl_usd is not None else 0.0
+        pct_pnl = float(pnl_pct) if pnl_pct is not None else 0.0
+        tipo_str = str(tipo)
+        motivo_str = str(motivo)
+        
         hora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        resultado = "WIN" if pnl_usd > 0 else "LOSS"
-        linea = f"[{hora}] {resultado} | {tipo} | IN: {entry_price:.2f} | OUT: {exit_price:.2f} | PNL%: {pnl_pct*100:.3f}% | NETO: ${pnl_usd:.4f}\n"
-        with open(log_file_path, "a") as f:
-            f.write(linea)
+        resultado = "WIN" if usd_pnl > 0 else "LOSS"
+        linea = f"[{hora}] {resultado} | {tipo_str} ({motivo_str}) | IN: {entry_p:.2f} | OUT: {exit_p:.2f} | PNL%: {pct_pnl*100:.3f}% | NETO: ${usd_pnl:.4f}\n"
+        
+        if log_file_path:
+            with open(log_file_path, "a") as f:
+                f.write(linea)
 
-        # Also log to the structured terminal log
-        log_terminal_event("INFO", "TRADE_SUMMARY", f"Trade {resultado}: {tipo} from {entry_price:.2f} to {exit_price:.2f}", terminal_log_file_path, {
-            "type": tipo,
-            "entry_price": entry_price,
-            "exit_price": exit_price,
-            "pnl_pct": pnl_pct,
-            "pnl_usd": pnl_usd,
-            "result": resultado
-        })
+        if terminal_log_file_path:
+            log_terminal_event("INFO", "TRADE_SUMMARY", f"Trade {resultado}: {tipo_str} ({motivo_str}) from {entry_p:.2f} to {exit_p:.2f}", terminal_log_file_path, {
+                "type": tipo_str,
+                "motivo": motivo_str,
+                "entry_price": entry_p,
+                "exit_price": exit_p,
+                "pnl_pct": pct_pnl,
+                "pnl_usd": usd_pnl,
+                "result": resultado
+            })
     except Exception as e:
         print(f"{Fore.RED}[ERROR] Error escribiendo log de trade: {e}")
-        log_terminal_event("ERROR", "TRADE_LOG_ERROR", f"Error escribiendo log de trade: {str(e)}", terminal_log_file_path)
 
 def guardar_estado_simulacion(state_file_path, posicion, precio_entrada, max_pnl_pct, pnl_acumulado, trades_totales, monto_invertido=6.0, rachas_perdidas=0, timestamp_entrada=0.0, confianza_ia=0.0):
     state = {
@@ -495,8 +506,8 @@ class CerebroIA:
             data_dict['macro_sentiment']
         ]], dtype=np.float32)
 
-        dmatrix = xgb.DMatrix(X, feature_names=['imbalance', 'spread', 'wall_gap', 'vol_total', 'ofi', 'ofi_ema_5', 'ofi_ema_15', 'cvd', 'liq_longs', 'liq_shorts', 'ema_15m_dist', 'rsi_5m', 'btc_trend', 'atr_5m', 'macro_sentiment'])
-        probs = self.model.get_booster().predict(dmatrix)[0]
+        # Zero-Pandas inference using inplace_predict to bypass DMatrix overhead
+        probs = self.model.get_booster().inplace_predict(X)[0]
 
         prob_up = 0.0
         prob_down = 0.0
@@ -516,7 +527,7 @@ class CerebroIA:
 
         return prob_up, prob_down
 
-def read_sentiment(sentiment_file_path, terminal_log_file_path):
+def read_sentiment(sentiment_file_path, terminal_log_file_path=None):
     try:
         if os.path.exists(sentiment_file_path):
             with open(sentiment_file_path, 'r') as f:
@@ -595,12 +606,13 @@ class CerebroRL:
             rsi_5m,
             data_dict.get('macro_sentiment', 0.0),
             data_dict.get('vwap_dist', 0.0),
+            data_dict.get('xgb_probability', 0.5),
             current_position,
             current_pnl_pct
         ], dtype=np.float32)
         
         # SB3 devuelve un tuple (action, state). Solo nos importa la accion.
-        action, _states = self.model.predict(obs, deterministic=False)
+        action, _states = self.model.predict(obs, deterministic=True)
                 
         return int(action)
 
