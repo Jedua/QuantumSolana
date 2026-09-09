@@ -19,14 +19,15 @@ class TradingEnv(gym.Env):
         self.df = df
         
         # Fill NaN values for new columns to avoid errors with older historical data
-        self.df.fillna({'vwap_dist': 0.0}, inplace=True)
+        self.df.fillna({'vwap_dist': 0.0, 'xgb_probability': 0.5}, inplace=True)
+        if 'xgb_probability' not in self.df.columns:
+            self.df['xgb_probability'] = 0.5
         
         self.n_steps = len(self.df)
         self.initial_balance = initial_balance
         self.leverage = leverage
         self.taker_fee = taker_fee # Comision por lado (0.05%)
         # CORRECTO: taker_fee*2*leverage = 0.02 → breakeven a 0.1% de precio = igual que produccion
-        # (0.001/20=0.005% era demasiado facil, enseñaba a salir con micro-movimientos)
         self.round_trip_fee = taker_fee * 2 * leverage
         
         # Acciones:
@@ -40,7 +41,8 @@ class TradingEnv(gym.Env):
         self.features_cols = [
             'imbalance', 'spread', 'wall_gap', 'vol_total', 'ofi', 
             'ofi_ema_5', 'ofi_ema_15', 'cvd', 'liq_longs', 'liq_shorts', 
-            'ema_15m_dist', 'rsi_5m', 'macro_sentiment', 'vwap_dist'
+            'ema_15m_dist', 'rsi_5m', 'macro_sentiment', 'vwap_dist',
+            'xgb_probability'
         ]
         
         # El observation space incluye features del mercado + estado del agente (posición y PnL)
@@ -116,7 +118,7 @@ class TradingEnv(gym.Env):
         best_bid = row['best_bid']
         best_ask = row['best_ask']
         
-        # --- LÓGICA DE ACCIONES ---
+        # --- LÓGICA DE ACCIONES SIMÉTRICA ---
         
         # 0: Hold (Nada cambia)
         if action == 0:
@@ -125,7 +127,9 @@ class TradingEnv(gym.Env):
         # 1: Open Long
         elif action == 1:
             if self.position == -1:
-                # Cerrar Short existente
+                # Cerrar Short existente primero
+                if self.unrealized_pnl > 0: reward += self.unrealized_pnl * 1.0
+                else: reward += self.unrealized_pnl * 0.5
                 self.position = 0
                 self.unrealized_pnl = 0.0
                 self.ticks_in_trade = 0
@@ -135,14 +139,14 @@ class TradingEnv(gym.Env):
                 self.position = 1
                 self.entry_price = best_ask
                 self.trades_count += 1
-                # Castigo inmediato por pagar comision de ida y vuelta
-                reward -= self.round_trip_fee
-                self.unrealized_pnl = -self.round_trip_fee
+                self.unrealized_pnl = 0.0
                 
         # 2: Open Short
         elif action == 2:
             if self.position == 1:
-                # Cerrar Long existente
+                # Cerrar Long existente primero
+                if self.unrealized_pnl > 0: reward += self.unrealized_pnl * 1.0
+                else: reward += self.unrealized_pnl * 0.5
                 self.position = 0
                 self.unrealized_pnl = 0.0
                 self.ticks_in_trade = 0
@@ -152,28 +156,23 @@ class TradingEnv(gym.Env):
                 self.position = -1
                 self.entry_price = best_bid
                 self.trades_count += 1
-                # Castigo inmediato por pagar comision de ida y vuelta
-                reward -= self.round_trip_fee
-                self.unrealized_pnl = -self.round_trip_fee
+                self.unrealized_pnl = 0.0
                 
         # 3: Close Position
         elif action == 3:
             if self.position == 0:
-                reward -= 0.0002  # Castigo por accion invalida
+                reward -= 0.0005  # Castigo minimo por cerrar sin posicion
             else:
-                # REWARD ASIMETRICO AL CIERRE:
-                # El modelo aprende QUE tan bueno fue el trade al cerrar
-                if self.unrealized_pnl >= 0.078:      # >= 0.49% TP en produccion
-                    reward += 0.20  # Gran bono: cerro en zona de TP objetivo
-                elif self.unrealized_pnl >= 0.02:    # En positivo pero bajo el objetivo
-                    reward += 0.04  # Bono menor: al menos es ganancia
-                elif self.unrealized_pnl < -0.01:    # Cerrar con perdida significativa
-                    reward -= 0.08  # Penalizacion extra: no debio cerrar aqui
+                # Materializar PnL al cerrar
+                if self.unrealized_pnl > 0:
+                    reward += self.unrealized_pnl * 1.2  # Bonus por cerrar en ganancia
+                else:
+                    reward += self.unrealized_pnl * 0.5  # Penalizacion por perdida
                 self.position = 0
                 self.unrealized_pnl = 0.0
                 self.ticks_in_trade = 0
 
-        # --- DENSE NET PNL (PnL Real Paso a Paso) ---
+        # --- DENSE NET PNL (Recompensa continua simétrica por tick) ---
         if self.position != 0:
             current_net = 0.0
             if self.position == 1:
@@ -183,37 +182,27 @@ class TradingEnv(gym.Env):
                 gross_pnl = (self.entry_price - best_ask) / self.entry_price
                 current_net = (gross_pnl * self.leverage) - self.round_trip_fee
                 
-            # La recompensa es el cambio exacto en el PnL neto desde el tick anterior
-            reward += current_net - self.unrealized_pnl
+            # Recompensa por cambio de PnL (delta reward)
+            pnl_delta = current_net - self.unrealized_pnl
+            reward += pnl_delta * 2.0  # Amplificar senal de PnL
             self.unrealized_pnl = current_net
             
-            # BONO DE PACIENCIA: Estar en zona de ganancia objetivo da recompensa extra
-            # Objetivo: 0.49% TP en produccion = current_net >= 0.078 en el entorno
-            if current_net >= 0.078:
-                reward += 0.003  # Bono continuo por tick que se mantiene en la zona TP
-            
-            # Penalizacion pequeña por tiempo (Time Decay)
+            # Time decay suave
             self.ticks_in_trade += 1
-            reward -= 0.000005 
+            reward -= 0.000005
             
-            # Cortacircuitos de seguridad (Stop Loss Forzado)
-            # SL a 0.63% de precio con fee=0.02: net = -0.0063*20 - 0.02 = -0.146
-            if current_net <= -0.146:  # Equivalente a SL de produccion de 0.63%
-                reward -= 0.3
+            # Stop Loss forzado
+            if current_net <= -0.15:
+                reward -= 0.1
                 self.position = 0
                 self.unrealized_pnl = 0.0
                 self.ticks_in_trade = 0
 
-            elif self.ticks_in_trade > 2700 and current_net <= 0.0005:
-                reward -= 0.05 # Ligero castigo por estancamiento
+            elif self.ticks_in_trade > 3000 and current_net <= 0.001:
+                reward -= 0.02
                 self.position = 0
                 self.unrealized_pnl = 0.0
                 self.ticks_in_trade = 0
-
-        # --- ANTI-INACTIVIDAD UNIVERSAL ---
-        # FIX #3: Reducido 10x para no forzar entradas desesperadas sin señal clara
-        if self.position == 0:
-            reward -= 0.00005
 
         # Balance tracking virtual
         self.balance += reward * self.initial_balance
@@ -224,14 +213,15 @@ class TradingEnv(gym.Env):
         # Comprobar si hemos llegado al final
         if self.current_step >= self.n_steps - 1:
             done = True
-            # --- CASTIGO POR INACTIVIDAD TOTAL ---
             if self.trades_count == 0:
-                reward -= 1.0  # Penalización severa: no operar en todo el episodio es inaceptable
+                reward -= 2.0  # Penalizacion severa por no operar
+            elif self.trades_count < 5:
+                reward -= 0.5  # Penalizacion por operar muy poco
             
         # Comprobar bancarrota
         if self.balance <= self.initial_balance * 0.1:
             done = True
-            reward -= 1.0 # Penalización por quebrar
+            reward -= 1.0
             
         obs = self._get_obs()
         info = {

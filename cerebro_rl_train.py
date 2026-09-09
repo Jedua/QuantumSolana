@@ -17,14 +17,27 @@ from bot_core import GestorDB
 init(autoreset=True)
 
 DB_NAME = "cerebro_sol.db"
-MODEL_PATH = "modelo_rl_sol" # stable-baselines3 agrega el .zip automáticamente
+MODEL_PATH = "modelo_rl_sol_v10" # stable-baselines3 agrega el .zip automáticamente
 TERMINAL_LOG_PATH = "log_terminal_data.json"
 
 def recalcular_features(df):
-    """Reconstruye las features de OFI y EMAs en caso de que falten en la BD antigua"""
+    """Reconstruye las features de OFI, RSI y EMAs en caso de que falten en la BD antigua"""
     for col in ['cvd', 'liq_longs', 'liq_shorts', 'ema_15m_dist', 'rsi_5m', 'macro_sentiment', 'vwap_dist']:
         if col not in df.columns: df[col] = 0.0
         else: df[col] = df[col].fillna(0.0)
+
+    # Recalcular RSI 5m (rolling window 300 ticks) si los datos son planos/constantes
+    if (df['rsi_5m'] == 50.0).all() or (df['rsi_5m'].std() == 0):
+        delta = df['mid_price'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=300, min_periods=1).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=300, min_periods=1).mean()
+        rs = gain / loss.replace(0, 1e-5)
+        df['rsi_5m'] = 100 - (100 / (1 + rs))
+
+    # Recalcular EMA 15m dist (span 900 ticks) si los datos son ceros
+    if (df['ema_15m_dist'] == 0.0).all():
+        ema_15m = df['mid_price'].ewm(span=900, adjust=False).mean()
+        df['ema_15m_dist'] = (df['mid_price'] - ema_15m) / ema_15m
         
     # Recalcular VWAP si está en ceros (datos antiguos)
     if (df['vwap_dist'] == 0.0).all():
@@ -142,13 +155,11 @@ def main():
     )
     
     if os.path.exists(MODEL_PATH + ".zip"):
-        # Al cambiar la arquitectura de la red (net_arch), el modelo viejo es matematicamente incompatible.
-        # Renombramos el archivo viejo como backup y empezamos fresco para curar el sesgo Long.
-        backup_name = MODEL_PATH + "_backup_long_bias.zip"
+        backup_name = MODEL_PATH + "_backup_hold_collapse.zip"
         if os.path.exists(backup_name):
             os.remove(backup_name)
         os.rename(MODEL_PATH + ".zip", backup_name)
-        print(f"{Fore.BLUE}[INFO] Modelo sesgado respaldado como {backup_name}. Empezando multiverso desde cero.")
+        print(f"{Fore.BLUE}[INFO] Modelo anterior respaldado como {backup_name}. Entrenando desde cero con reward corregido.")
         
     print(f"\n{Fore.GREEN}[TRAIN] Iniciando entrenamiento (2,000,000 timesteps)...")
     try:

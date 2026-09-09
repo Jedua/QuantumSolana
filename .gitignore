@@ -78,3 +78,4 @@ scratch/
 # --- DATOS DE MERCADO (Regenerables desde la API) ---
 data/
 datasets/
+reportes
