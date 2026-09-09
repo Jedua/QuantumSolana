@@ -183,14 +183,24 @@ def main_loop(db, ia, exp, risk_manager, filtro_xgb):
 
             # Control de entradas y salidas
             if posicion is None:
-                # --- FILTRO DE VOLATILIDAD DINAMICO (Adaptativo al precio) ---
-                # ATR minimo dinamico proporcional al precio (0.12% del mid_price, min $0.06).
-                # Garantiza adaptabilidad tanto a SOL a $74 como a $200.
-                atr_minimo = max(0.06, mid_price * 0.0012)
+                # --- FILTROS CUANTITATIVOS ROBUSTOS ---
+                # 1. Filtro de Regimen de Mercado (Evitar shocks de volatilidad destructivos)
+                mercado_favorable = regimen_actual != "SHOCK"
+                
+                # 2. Filtro de Volatilidad Dinámica (Adaptativo al precio de SOL)
+                atr_minimo = max(0.06, mid_price * 0.0010)
                 mercado_tiene_volatilidad = cached_atr_5m >= atr_minimo
                 
-                if action == 1 and mercado_tiene_volatilidad:
-                    # --- FILTRO XGBOOST: Bloquear entrada si el filtro la rechaza ---
+                # 3. Filtros de Microestructura (Alineados con config_params.json)
+                imb_actual = obs_dict.get('imbalance', 0.0)
+                ofi_actual = obs_dict.get('ofi', 0.0)
+                ofi_ema5_actual = obs_dict.get('ofi_ema_5', 0.0)
+                
+                filtro_long_ok = (imb_actual >= bot_core.UMBRAL_IMBALANCE * 0.5) and (ofi_actual >= bot_core.OFI_THRESHOLD)
+                filtro_short_ok = (imb_actual <= -bot_core.UMBRAL_IMBALANCE * 0.5) and (ofi_actual <= -bot_core.OFI_THRESHOLD)
+
+                if action == 1 and mercado_favorable and mercado_tiene_volatilidad and filtro_long_ok:
+                    # --- FILTRO XGBOOST: Bloquear entrada si el filtro secundario la rechaza ---
                     if not filtro_xgb.aprobar_trade(obs_dict):
                         action = 0
                     else:
@@ -209,8 +219,8 @@ def main_loop(db, ia, exp, risk_manager, filtro_xgb):
                             print(f"\n{Fore.GREEN}[ENTRY LONG] Entrada al Ask: ${precio_entrada:.2f} | IMB: {obs_dict['imbalance']:.4f} | OFI: {obs_dict['ofi']:.2f} | ATR: {cached_atr_5m:.4f}")
                             guardar_estado_simulacion(PAPER_STATE_FILE, posicion, precio_entrada, max_pnl_pct, pnl_acumulado, trades_totales, monto_invertido, rachas_perdidas, timestamp_entrada, 0.0)
 
-                elif action == 2 and mercado_tiene_volatilidad:
-                    # --- FILTRO XGBOOST: Bloquear entrada si el filtro la rechaza ---
+                elif action == 2 and mercado_favorable and mercado_tiene_volatilidad and filtro_short_ok:
+                    # --- FILTRO XGBOOST: Bloquear entrada si el filtro secundario la rechaza ---
                     if not filtro_xgb.aprobar_trade(obs_dict):
                         action = 0
                     else:
@@ -234,16 +244,14 @@ def main_loop(db, ia, exp, risk_manager, filtro_xgb):
                     max_pnl_pct = current_pnl_pct
 
                 # Salidas por estrategia
-                if action == 3 and (current_pnl_pct >= 0.0045 or (now - timestamp_entrada > 900)):
+                if action == 3 and (current_pnl_pct >= 0.0035 or (now - timestamp_entrada > 900)):
                     cerrar_posicion("RL_CLOSE")
-                elif max_pnl_pct >= bot_core.TAKE_PROFIT_PCT and (max_pnl_pct - current_pnl_pct) >= (bot_core.TAKE_PROFIT_PCT * 0.50):
+                elif max_pnl_pct >= bot_core.TAKE_PROFIT_PCT and (max_pnl_pct - current_pnl_pct) >= (bot_core.TAKE_PROFIT_PCT * 0.35):
                     cerrar_posicion("TAKE_PROFIT/TS")
                 elif current_pnl_pct <= -bot_core.STOP_LOSS_PCT:
                     cerrar_posicion("HARD_SL")
-                elif now - timestamp_entrada > 5400 and current_pnl_pct <= 0.0005:
+                elif now - timestamp_entrada > 3600 and current_pnl_pct <= 0.0005:
                     cerrar_posicion("TIME_DECAY")
-
-            time.sleep(0.001)
 
         except Exception as e:
             print(f"{Fore.RED}[ERROR HOT LOOP V10] {e}")

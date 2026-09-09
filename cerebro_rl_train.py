@@ -21,62 +21,77 @@ MODEL_PATH = "modelo_rl_sol_v10" # stable-baselines3 agrega el .zip automáticam
 TERMINAL_LOG_PATH = "log_terminal_data.json"
 
 def recalcular_features(df):
-    """Reconstruye las features de OFI, RSI y EMAs en caso de que falten en la BD antigua"""
-    for col in ['cvd', 'liq_longs', 'liq_shorts', 'ema_15m_dist', 'rsi_5m', 'macro_sentiment', 'vwap_dist']:
-        if col not in df.columns: df[col] = 0.0
-        else: df[col] = df[col].fillna(0.0)
+    """Reconstruye y calcula vectorialmente las features técnicas y microestructurales."""
+    # Asegurar existencia de columnas base
+    cols_base = ['cvd', 'liq_longs', 'liq_shorts', 'ema_15m_dist', 'rsi_5m', 'macro_sentiment', 'vwap_dist', 'atr_5m', 'btc_trend']
+    for col in cols_base:
+        if col not in df.columns: 
+            df[col] = 0.0
+        else: 
+            df[col] = df[col].fillna(0.0)
 
-    # Recalcular RSI 5m (rolling window 300 ticks) si los datos son planos/constantes
+    # 1. RSI 5m (Rolling window de 300 ticks ~ 5 minutos de flujo continuo)
     if (df['rsi_5m'] == 50.0).all() or (df['rsi_5m'].std() == 0):
         delta = df['mid_price'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=300, min_periods=1).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=300, min_periods=1).mean()
-        rs = gain / loss.replace(0, 1e-5)
-        df['rsi_5m'] = 100 - (100 / (1 + rs))
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(span=300, min_periods=30, adjust=False).mean()
+        avg_loss = loss.ewm(span=300, min_periods=30, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, 1e-6)
+        df['rsi_5m'] = (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
 
-    # Recalcular EMA 15m dist (span 900 ticks) si los datos son ceros
-    if (df['ema_15m_dist'] == 0.0).all():
+    # 2. EMA 15m dist (span 900 ticks)
+    if (df['ema_15m_dist'] == 0.0).all() or (df['ema_15m_dist'].std() == 0):
         ema_15m = df['mid_price'].ewm(span=900, adjust=False).mean()
-        df['ema_15m_dist'] = (df['mid_price'] - ema_15m) / ema_15m
-        
-    # Recalcular VWAP si está en ceros (datos antiguos)
-    if (df['vwap_dist'] == 0.0).all():
-        df['pv'] = df['mid_price'] * df['vol_total']
-        cumulative_pv = df['pv'].cumsum()
-        cumulative_v = df['vol_total'].cumsum()
-        vwap = cumulative_pv / cumulative_v
-        df['vwap_dist'] = (df['mid_price'] - vwap) / vwap
-        df = df.drop(columns=['pv'])
+        df['ema_15m_dist'] = ((df['mid_price'] - ema_15m) / ema_15m).fillna(0.0)
 
-    if 'ofi' not in df.columns or 'ofi_ema_5' not in df.columns:
-        df['vol_bid'] = df['vol_total'] * (1 + df['imbalance']) / 2
-        df['vol_ask'] = df['vol_total'] * (1 - df['imbalance']) / 2
-        df['e_b'] = 0.0
-        df['e_a'] = 0.0
-        
-        df.loc[df['best_bid'] > df['best_bid'].shift(1), 'e_b'] = df['vol_bid']
-        df.loc[df['best_bid'] == df['best_bid'].shift(1), 'e_b'] = df['vol_bid'] - df['vol_bid'].shift(1)
-        df.loc[df['best_bid'] < df['best_bid'].shift(1), 'e_b'] = -df['vol_bid'].shift(1)
-        
-        df.loc[df['best_ask'] < df['best_ask'].shift(1), 'e_a'] = df['vol_ask']
-        df.loc[df['best_ask'] == df['best_ask'].shift(1), 'e_a'] = df['vol_ask'] - df['vol_ask'].shift(1)
-        df.loc[df['best_ask'] > df['best_ask'].shift(1), 'e_a'] = -df['vol_ask'].shift(1)
-        
-        df['ofi'] = df['e_b'] - df['e_a']
-        
-        span_5, span_15 = 5, 15
-        alpha_5, alpha_15 = 2 / (span_5 + 1), 2 / (span_15 + 1)
-        df['ofi_ema_5'] = 0.0
-        df['ofi_ema_15'] = 0.0
-        
-        if len(df) > 0:
-            df.loc[0, 'ofi_ema_5'] = df.loc[0, 'ofi']
-            df.loc[0, 'ofi_ema_15'] = df.loc[0, 'ofi']
-            for i in range(1, len(df)):
-                df.loc[i, 'ofi_ema_5'] = alpha_5 * df.loc[i, 'ofi'] + (1 - alpha_5) * df.loc[i-1, 'ofi_ema_5']
-                df.loc[i, 'ofi_ema_15'] = alpha_15 * df.loc[i, 'ofi'] + (1 - alpha_15) * df.loc[i-1, 'ofi_ema_15']
+    # 3. ATR 5m aproximado sobre ticks (span 300)
+    if 'atr_5m' not in df.columns or (df['atr_5m'] == 0.0).all():
+        high = df['best_ask']
+        low = df['best_bid']
+        hl = high - low
+        df['atr_5m'] = hl.rolling(window=300, min_periods=10).mean().bfill().fillna(0.1)
 
-    return df.dropna().reset_index(drop=True)
+    # 4. VWAP dist (Rolling window 1800 ticks ~ 30 minutos de session)
+    if (df['vwap_dist'] == 0.0).all() or (df['vwap_dist'].std() == 0):
+        pv = df['mid_price'] * df['vol_total']
+        cum_pv = pv.rolling(window=1800, min_periods=50).sum()
+        cum_vol = df['vol_total'].rolling(window=1800, min_periods=50).sum()
+        vwap = cum_pv / cum_vol.replace(0, 1e-6)
+        df['vwap_dist'] = ((df['mid_price'] - vwap) / vwap).fillna(0.0)
+
+    # 5. OFI y EMAs vectorizadas al 100% (sin bucles for de Python)
+    if 'ofi' not in df.columns or (df['ofi'] == 0.0).all():
+        vol_bid = df['vol_total'] * (1 + df['imbalance']) / 2.0
+        vol_ask = df['vol_total'] * (1 - df['imbalance']) / 2.0
+        
+        b_bid = df['best_bid']
+        b_bid_prev = b_bid.shift(1).bfill()
+        v_bid_prev = vol_bid.shift(1).bfill()
+        
+        e_b = pd.Series(0.0, index=df.index)
+        e_b = np.where(b_bid > b_bid_prev, vol_bid,
+              np.where(b_bid == b_bid_prev, vol_bid - v_bid_prev, -v_bid_prev))
+        
+        b_ask = df['best_ask']
+        b_ask_prev = b_ask.shift(1).bfill()
+        v_ask_prev = vol_ask.shift(1).bfill()
+        
+        e_a = pd.Series(0.0, index=df.index)
+        e_a = np.where(b_ask < b_ask_prev, vol_ask,
+              np.where(b_ask == b_ask_prev, vol_ask - v_ask_prev, -v_ask_prev))
+              
+        df['ofi'] = e_b - e_a
+
+    if 'ofi_ema_5' not in df.columns or (df['ofi_ema_5'] == 0.0).all():
+        df['ofi_ema_5'] = df['ofi'].ewm(span=5, adjust=False).mean()
+        
+    if 'ofi_ema_15' not in df.columns or (df['ofi_ema_15'] == 0.0).all():
+        df['ofi_ema_15'] = df['ofi'].ewm(span=15, adjust=False).mean()
+
+    # Sanitización de infinitos y NaNs
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=['mid_price', 'best_bid', 'best_ask']).reset_index(drop=True)
+    return df
 
 def main():
     print(f"{Fore.MAGENTA}=====================================================")
@@ -135,21 +150,21 @@ def main():
     vec_env = DummyVecEnv([lambda: env_normal, lambda: env_invertido])
     
     # Configurar el Agente PPO
-    print(f"\n{Fore.YELLOW}[TRAIN] Construyendo modelo PPO...")
-    # Usamos MlpPolicy (Red Neuronal Perceptrón Multicapa)
-    # Aumentamos la arquitectura a 3 capas de 256 neuronas
+    print(f"\n{Fore.YELLOW}[TRAIN] Construyendo modelo PPO optimizado para Scalping HFT...")
+    # Usamos MlpPolicy con capas balanceadas para inferencia ultra-rapida
     model = PPO(
         "MlpPolicy", 
         vec_env, 
         verbose=1,
-        learning_rate=0.0003,
-        n_steps=4096,       # Más contexto por batch (era 2048)
-        batch_size=256,
+        learning_rate=0.00025,
+        n_steps=2048,
+        batch_size=128,
         n_epochs=10,
-        gamma=0.97,          # Priorizar recompensas cercanas (scalping)
-        ent_coef=0.06,       # Exploración agresiva para romper Hold-Collapse
-        clip_range=0.1,      # Aprendizaje más conservador y estable
-        policy_kwargs=dict(net_arch=[256, 256, 256]), # CEREBRO MÁS GRANDE
+        gamma=0.98,
+        gae_lambda=0.95,
+        ent_coef=0.015,       # Exploracion equilibrada sin forzar sobreoperacion
+        clip_range=0.2,
+        policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256])),
         device="auto",
         tensorboard_log="./tensorboard_rl_logs/"
     )
