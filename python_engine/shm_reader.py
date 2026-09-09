@@ -2,6 +2,8 @@ import mmap
 import ctypes
 import time
 import numpy as np
+import win32event
+import win32con
 
 class Level(ctypes.Structure):
     _fields_ = [
@@ -37,6 +39,13 @@ class SharedMemoryReader:
         # Windows named shared memory mapping uses fileno -1
         self.mm = mmap.mmap(-1, self.shm_size, tagname=self.shm_name, access=mmap.ACCESS_WRITE)
         
+        # Open Windows Named Event created by C++
+        try:
+            self.event_handle = win32event.OpenEvent(win32event.SYNCHRONIZE, False, "QuantSolana_V10_Event")
+        except Exception as e:
+            print(f"Warning: Could not open QuantSolana_V10_Event. Make sure C++ feed is running. {e}")
+            self.event_handle = None
+        
     def read_latest_state(self, max_retries=1000):
         for _ in range(max_retries):
             # 1. Read the initial sequence directly from the start of the buffer
@@ -59,6 +68,12 @@ class SharedMemoryReader:
                 return block.state
                 
         raise RuntimeError("Demasiados reintentos por Torn Read. Posible bloqueo o desincronizacion severa en C++.")
+
+    def wait_for_update(self, timeout_ms=1000):
+        if self.event_handle:
+            win32event.WaitForSingleObject(self.event_handle, timeout_ms)
+        else:
+            time.sleep(0.001)
 
     def get_obs_dict(self):
         state = self.read_latest_state()

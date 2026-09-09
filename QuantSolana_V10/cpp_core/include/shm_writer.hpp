@@ -6,6 +6,10 @@
 #include <atomic>
 #include <cstring>
 #include <iostream>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 
 namespace quantsolana {
 
@@ -19,6 +23,7 @@ class SharedMemoryWriter {
     boost::interprocess::windows_shared_memory shm_;
     boost::interprocess::mapped_region region_;
     SharedMemoryBlock* block_;
+    HANDLE event_handle_;
 
 public:
     explicit SharedMemoryWriter(const char* shm_name = "QuantSolana_V10_SHM") {
@@ -41,6 +46,18 @@ public:
         
         // Initialize sequence safely
         block_->sequence.store(0, std::memory_order_relaxed);
+        
+        // Initialize Windows Named Event for Zero-Latency IPC
+        event_handle_ = CreateEventA(NULL, FALSE, FALSE, "QuantSolana_V10_Event");
+        if (!event_handle_) {
+            std::cerr << "Warning: Failed to create/open QuantSolana_V10_Event. IPC will fallback to polling.\n";
+        }
+    }
+
+    ~SharedMemoryWriter() {
+        if (event_handle_) {
+            CloseHandle(event_handle_);
+        }
     }
 
     // Seqlock write logic
@@ -55,6 +72,11 @@ public:
         // 3. Increment sequence to even (signaling write complete)
         // Memory order release ensures memcpy commits to RAM before sequence updates
         block_->sequence.store(seq + 2, std::memory_order_release);
+
+        // 4. Fire the event to wake up Python instantly
+        if (event_handle_) {
+            SetEvent(event_handle_);
+        }
     }
 };
 
