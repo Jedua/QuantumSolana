@@ -117,9 +117,11 @@ class TradingEnv(gym.Env):
         
         best_bid = row['best_bid']
         best_ask = row['best_ask']
+        spread_cost_long = (best_ask - best_bid) / best_bid
+        spread_cost_short = (best_ask - best_bid) / best_ask
+        fee_one_way = self.taker_fee * self.leverage  # ej. 0.0005 * 20 = 0.01 (1% del margen)
         
-        # --- LÓGICA DE ACCIONES SIMÉTRICA ---
-        
+        # --- LÓGICA DE ACCIONES ---
         # 0: Hold (Nada cambia)
         if action == 0:
             pass
@@ -127,108 +129,110 @@ class TradingEnv(gym.Env):
         # 1: Open Long
         elif action == 1:
             if self.position == -1:
-                # Cerrar Short existente primero
-                if self.unrealized_pnl > 0: reward += self.unrealized_pnl * 1.0
-                else: reward += self.unrealized_pnl * 0.5
+                # Cerrar Short previo pagando Ask y comision
+                pnl_gross = (self.entry_price - best_ask) / self.entry_price
+                net_close_pnl = (pnl_gross * self.leverage) - (fee_one_way * 2.0)
+                reward += net_close_pnl
+                self.balance += net_close_pnl * self.initial_balance
                 self.position = 0
                 self.unrealized_pnl = 0.0
                 self.ticks_in_trade = 0
                 
             if self.position == 0:
-                # Abrir Long (Paga el Ask)
+                # Abrir Long pagando el Ask
                 self.position = 1
                 self.entry_price = best_ask
                 self.trades_count += 1
-                self.unrealized_pnl = 0.0
+                self.ticks_in_trade = 0
+                # Costo inmediato de entrada: comision de apertura + medio spread
+                entry_friction = - (fee_one_way + (spread_cost_long * self.leverage * 0.5))
+                reward += entry_friction
+                self.unrealized_pnl = entry_friction
                 
         # 2: Open Short
         elif action == 2:
             if self.position == 1:
-                # Cerrar Long existente primero
-                if self.unrealized_pnl > 0: reward += self.unrealized_pnl * 1.0
-                else: reward += self.unrealized_pnl * 0.5
+                # Cerrar Long previo vendiendo al Bid y pagando comision
+                pnl_gross = (best_bid - self.entry_price) / self.entry_price
+                net_close_pnl = (pnl_gross * self.leverage) - (fee_one_way * 2.0)
+                reward += net_close_pnl
+                self.balance += net_close_pnl * self.initial_balance
                 self.position = 0
                 self.unrealized_pnl = 0.0
                 self.ticks_in_trade = 0
                 
             if self.position == 0:
-                # Abrir Short (Paga el Bid)
+                # Abrir Short vendiendo al Bid
                 self.position = -1
                 self.entry_price = best_bid
                 self.trades_count += 1
-                self.unrealized_pnl = 0.0
+                self.ticks_in_trade = 0
+                # Costo inmediato de entrada: comision de apertura + medio spread
+                entry_friction = - (fee_one_way + (spread_cost_short * self.leverage * 0.5))
+                reward += entry_friction
+                self.unrealized_pnl = entry_friction
                 
-        # 3: Close Position
+        # 3: Close Position (Pasa a Flat)
         elif action == 3:
-            if self.position == 0:
-                reward -= 0.0005  # Castigo minimo por cerrar sin posicion
-            else:
-                # Materializar PnL al cerrar
-                if self.unrealized_pnl > 0:
-                    reward += self.unrealized_pnl * 1.2  # Bonus por cerrar en ganancia
+            if self.position != 0:
+                if self.position == 1:
+                    pnl_gross = (best_bid - self.entry_price) / self.entry_price
                 else:
-                    reward += self.unrealized_pnl * 0.5  # Penalizacion por perdida
+                    pnl_gross = (self.entry_price - best_ask) / self.entry_price
+                    
+                net_close_pnl = (pnl_gross * self.leverage) - (fee_one_way * 2.0)
+                reward += net_close_pnl
+                self.balance += net_close_pnl * self.initial_balance
                 self.position = 0
                 self.unrealized_pnl = 0.0
                 self.ticks_in_trade = 0
 
-        # --- DENSE NET PNL (Recompensa continua simétrica por tick) ---
+        # --- DENSE PNL TRACKING POR TICK ---
         if self.position != 0:
-            current_net = 0.0
+            self.ticks_in_trade += 1
             if self.position == 1:
-                gross_pnl = (best_bid - self.entry_price) / self.entry_price
-                current_net = (gross_pnl * self.leverage) - self.round_trip_fee
-            elif self.position == -1:
-                gross_pnl = (self.entry_price - best_ask) / self.entry_price
-                current_net = (gross_pnl * self.leverage) - self.round_trip_fee
+                current_gross = (best_bid - self.entry_price) / self.entry_price
+            else:
+                current_gross = (self.entry_price - best_ask) / self.entry_price
                 
-            # Recompensa por cambio de PnL (delta reward)
+            current_net = (current_gross * self.leverage) - (fee_one_way * 2.0)
+            
+            # Delta PnL de recompensa continua
             pnl_delta = current_net - self.unrealized_pnl
-            reward += pnl_delta * 2.0  # Amplificar senal de PnL
+            reward += pnl_delta
             self.unrealized_pnl = current_net
             
-            # Time decay suave
-            self.ticks_in_trade += 1
-            reward -= 0.000005
+            # Penalización suave por mantener posiciones excesivamente prolongadas sin ganancia
+            if self.ticks_in_trade > 1800 and current_net < 0:
+                reward -= 0.0001
             
-            # Stop Loss forzado
-            if current_net <= -0.15:
-                reward -= 0.1
-                self.position = 0
-                self.unrealized_pnl = 0.0
-                self.ticks_in_trade = 0
-
-            elif self.ticks_in_trade > 3000 and current_net <= 0.001:
+            # Hard Stop Loss en entorno (-8% del margen)
+            if current_net <= -0.08:
                 reward -= 0.02
+                self.balance += current_net * self.initial_balance
                 self.position = 0
                 self.unrealized_pnl = 0.0
                 self.ticks_in_trade = 0
-
-        # Balance tracking virtual
-        self.balance += reward * self.initial_balance
 
         # --- AVANCE DE TIEMPO ---
         self.current_step += 1
         
-        # Comprobar si hemos llegado al final
+        # Fin del episodio
         if self.current_step >= self.n_steps - 1:
             done = True
             if self.trades_count == 0:
-                reward -= 2.0  # Penalizacion severa por no operar
-            elif self.trades_count < 5:
-                reward -= 0.5  # Penalizacion por operar muy poco
+                reward -= 1.0  # Castigo por inactividad total
             
-        # Comprobar bancarrota
-        if self.balance <= self.initial_balance * 0.1:
+        # Bancarrota (50% de drawdown en el entorno)
+        if self.balance <= self.initial_balance * 0.5:
             done = True
-            reward -= 1.0
+            reward -= 0.5
             
         obs = self._get_obs()
         info = {
             'balance': self.balance,
             'trades': self.trades_count
         }
-        
         # Requerimientos de Gymnasium (obs, reward, terminated, truncated, info)
         return obs, reward, done, False, info
 
