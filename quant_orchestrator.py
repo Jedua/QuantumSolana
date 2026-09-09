@@ -18,12 +18,21 @@ def get_exec_env():
         env["PATH"] = conda_bin + os.pathsep + env.get("PATH", "")
     return env
 
+def get_log_file(name):
+    root_cwd = os.path.dirname(os.path.abspath(__file__))
+    log_dir = os.path.join(root_cwd, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    safe_name = name.replace(" ", "_").replace("(", "").replace(")", "")
+    log_path = os.path.join(log_dir, f"{safe_name}_error.log")
+    return open(log_path, "a")
+
 def run_native_binary(binary_path, name):
     print(f"{Fore.CYAN}[ORQUESTADOR] Iniciando binario nativo C++ {name} ({binary_path})...")
     try:
         root_cwd = os.path.dirname(os.path.abspath(__file__))
-        process = subprocess.Popen([binary_path], cwd=root_cwd, env=get_exec_env())
-        print(f"{Fore.GREEN}[ORQUESTADOR] {name} iniciado con PID: {process.pid}")
+        log_file = get_log_file(name)
+        process = subprocess.Popen([binary_path], cwd=root_cwd, env=get_exec_env(), stderr=log_file)
+        print(f"{Fore.GREEN}[ORQUESTADOR] {name} iniciado con PID: {process.pid}. Errores guardados en logs/")
         return process
     except Exception as e:
         print(f"{Fore.RED}[ORQUESTADOR ERROR] No se pudo iniciar {name}: {e}")
@@ -37,8 +46,10 @@ def run_python_script(script_path, name):
         conda_python = r"C:\Users\pepel\miniconda3\envs\cerebro_v10\python.exe"
         if os.path.exists(conda_python):
             python_exe = conda_python
-        process = subprocess.Popen([python_exe, script_path], cwd=root_cwd, env=get_exec_env())
-        print(f"{Fore.GREEN}[ORQUESTADOR] {name} iniciado con PID: {process.pid}")
+        
+        log_file = get_log_file(name)
+        process = subprocess.Popen([python_exe, script_path], cwd=root_cwd, env=get_exec_env(), stderr=log_file)
+        print(f"{Fore.GREEN}[ORQUESTADOR] {name} iniciado con PID: {process.pid}. Errores guardados en logs/")
         return process
     except Exception as e:
         print(f"{Fore.RED}[ORQUESTADOR ERROR] No se pudo iniciar {name}: {e}")
