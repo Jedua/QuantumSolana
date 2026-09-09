@@ -107,10 +107,11 @@ def main_loop(db, ia, exp, risk_manager, filtro_xgb):
 
     while True:
         try:
+            shm_reader.wait_for_update(timeout_ms=100)
+            
             try:
                 obs_dict = shm_reader.get_obs_dict()
             except Exception:
-                time.sleep(0.001)
                 continue
 
             # Deduplicacion: si el uid no cambio, esperar la proxima actualizacion del WebSocket
@@ -121,7 +122,6 @@ def main_loop(db, ia, exp, risk_manager, filtro_xgb):
                     if not shm_stale_warned:
                         print(f"[WARN] SHM congelada hace 30s (uid={current_uid}). Ingestor C++ posiblemente desconectado.")
                         shm_stale_warned = True
-                time.sleep(0.001)
                 continue
             last_update_id = current_uid
             last_uid_change_time = time.time()
